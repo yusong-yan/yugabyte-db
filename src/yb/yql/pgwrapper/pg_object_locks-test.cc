@@ -1378,13 +1378,24 @@ TEST_F(PgObjectLocksTestMixModeDuringPromotion, TestChainedTxnKeepsMode) {
 //
 // A transaction that started before the object locking infra auto flag was promoted keeps running
 // in the legacy mode, and must not use a catalog cache that a breaking DDL (REVOKE here)
-// invalidated. Its next new object lock refreshes its catalog cache, and PG's own privilege check
-// stops it. The tserver catalog version check must be skipped based on the mode of the request's
-// transaction, not on the tserver's flags.
-TEST_F(PgObjectLocksTestMixModeDuringPromotion, LegacyTxnKeepsCatalogVersionCheck) {
-  const auto* expected_legacy_error = "permission denied";
+// invalidated. With ysql_yb_disable_legacy_mode_local_object_locks on (the parameter is false), it
+// takes no object locks, so the tserver catalog version check is what stops it. The check must be
+// skipped based on the mode of the request's transaction, not on the tserver's flags. With it off,
+// the transaction's next new object lock refreshes its catalog cache, and PG's own privilege check
+// stops it.
+class PgObjectLocksTestLegacyTxnAcrossRevoke : public PgObjectLocksTestMixModeDuringPromotion,
+                                              public ::testing::WithParamInterface<bool> {};
+
+TEST_P(PgObjectLocksTestLegacyTxnAcrossRevoke, LegacyTxnKeepsCatalogVersionCheck) {
+  const auto legacy_txn_takes_object_locks = GetParam();
+  const auto* expected_legacy_error = legacy_txn_takes_object_locks
+      ? "permission denied"
+      : "The catalog snapshot used for this transaction has been invalidated";
   auto* ts1 = cluster_->tablet_server(0);
   auto* ts2 = cluster_->tablet_server(1);
+  ASSERT_OK(cluster_->SetFlag(
+      ts1, "ysql_yb_disable_legacy_mode_local_object_locks",
+      legacy_txn_takes_object_locks ? "false" : "true"));
   {
     auto conn = ASSERT_RESULT(LibPqTestBase::ConnectToTs(*ts1));
     ASSERT_OK(conn.Execute("CREATE ROLE r"));
@@ -1430,6 +1441,10 @@ TEST_F(PgObjectLocksTestMixModeDuringPromotion, LegacyTxnKeepsCatalogVersionChec
   ASSERT_STR_CONTAINS(result.status().ToString(), "permission denied");
 }
 
+INSTANTIATE_TEST_SUITE_P(
+    LegacyTxnTakesObjectLocks, PgObjectLocksTestLegacyTxnAcrossRevoke, ::testing::Bool(),
+    ::testing::PrintToStringParamName());
+
 // Tests for #36572.
 //
 // A new mode DDL relies on object locks to wait for, or block, concurrent DMLs. A transaction that
@@ -1443,6 +1458,12 @@ TEST_F(PgObjectLocksTestMixModeDuringPromotion, LegacyTxnKeepsCatalogVersionChec
 class PgObjectLocksTestLegacyTxnVsNewDdl : public PgObjectLocksTestMixModeDuringPromotion,
                                            public ::testing::WithParamInterface<bool> {
  protected:
+  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* opts) override {
+    PgObjectLocksTestMixModeDuringPromotion::UpdateMiniClusterOptions(opts);
+    opts->extra_tserver_flags.emplace_back(
+        "--ysql_yb_disable_legacy_mode_local_object_locks=false");
+  }
+
   void PromoteForDdl() {
     ASSERT_OK(cluster_->SetFlag(
         cluster_->tablet_server(1), "ysql_yb_enable_object_locking_infra", "true"));

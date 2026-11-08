@@ -972,7 +972,8 @@ static bool local_object_locking_for_curr_txn = false;
 
 void YBCSetObjectLockingInfraForCurrTxn() {
   object_locking_infra_for_curr_txn = yb_enable_object_locking_infra;
-  local_object_locking_for_curr_txn = true;
+  local_object_locking_for_curr_txn =
+      yb_enable_object_locking_infra || !yb_disable_legacy_mode_local_object_locks;
 }
 
 bool YBCIsObjectLockingInfraEnabled() {
