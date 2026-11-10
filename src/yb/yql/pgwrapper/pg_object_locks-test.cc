@@ -1430,55 +1430,6 @@ TEST_F(PgObjectLocksTestMixModeDuringPromotion, LegacyTxnKeepsCatalogVersionChec
   ASSERT_STR_CONTAINS(result.status().ToString(), "permission denied");
 }
 
-// Test for #37327.
-//
-// ysql_yb_disable_legacy_mode_local_object_locks is the way back if the local object locks that
-// legacy-mode transactions take during the promotion misbehave, because the auto flag cannot be
-// rolled back. With it on, a legacy-mode transaction takes no object locks, so a new mode REVOKE
-// does not wait for it, and its catalog cache is not refreshed. The tserver catalog version check
-// must then stop its next read, as before #36572.
-class PgObjectLocksTestLegacyLocksOff : public PgObjectLocksTestMixModeDuringPromotion {
- protected:
-  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* opts) override {
-    PgObjectLocksTestMixModeDuringPromotion::UpdateMiniClusterOptions(opts);
-    opts->extra_tserver_flags.emplace_back(
-        "--ysql_yb_disable_legacy_mode_local_object_locks=true");
-  }
-};
-
-TEST_F(PgObjectLocksTestLegacyLocksOff, LegacyTxnStoppedByCatalogVersionCheck) {
-  auto* ts1 = cluster_->tablet_server(0);
-  auto* ts2 = cluster_->tablet_server(1);
-  {
-    auto conn = ASSERT_RESULT(LibPqTestBase::ConnectToTs(*ts1));
-    ASSERT_OK(conn.Execute("CREATE ROLE r"));
-    ASSERT_OK(conn.Execute("CREATE TABLE test(k INT PRIMARY KEY, v INT)"));
-    ASSERT_OK(conn.Execute("INSERT INTO test SELECT generate_series(1, 10), 0"));
-    ASSERT_OK(conn.Execute("GRANT SELECT ON test TO r"));
-  }
-
-  auto legacy_conn = ASSERT_RESULT(LibPqTestBase::ConnectToTs(*ts1));
-  ASSERT_OK(legacy_conn.Execute("SET ROLE r"));
-  ASSERT_OK(legacy_conn.Execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ"));
-  ASSERT_EQ(ASSERT_RESULT(legacy_conn.FetchRow<int64_t>("SELECT COUNT(*) FROM test")), 10);
-
-  for (size_t i = 0; i < cluster_->num_tablet_servers(); ++i) {
-    ASSERT_OK(cluster_->SetFlag(
-        cluster_->tablet_server(i), "ysql_yb_enable_object_locking_infra", "true"));
-  }
-
-  auto ddl_conn = ASSERT_RESULT(LibPqTestBase::ConnectToTs(*ts2));
-  ASSERT_OK(ddl_conn.Execute("REVOKE SELECT ON test FROM r"));
-  WaitForCatalogVersionToPropagate();
-
-  auto result = legacy_conn.FetchRow<int64_t>("SELECT COUNT(*) FROM test");
-  ASSERT_NOK(result);
-  ASSERT_STR_CONTAINS(
-      result.status().ToString(),
-      "The catalog snapshot used for this transaction has been invalidated");
-  ASSERT_OK(legacy_conn.Execute("ROLLBACK"));
-}
-
 // Tests for #36572.
 //
 // A new mode DDL relies on object locks to wait for, or block, concurrent DMLs. A transaction that
@@ -2122,28 +2073,38 @@ TEST_F(PgObjectLocksTestNewTxnVsLegacyDdl, NewModeAddForeignKeyWithLegacyWriter)
   }
 }
 
-// Test for #37327.
+// Tests for #37327.
 //
-// ysql_yb_disable_legacy_mode_local_object_locks must also turn off the local object locks of a
-// transaction on a node with table locks off, which is not in new mode even after the infra auto
-// flag is promoted. With it on, a writer there takes no object locks, so a new mode CREATE INDEX
-// on another node does not wait for it.
-class PgObjectLocksTestTableLocksOffLocksOff : public PgObjectLocksTestNewTxnVsLegacyDdl {};
+// ysql_yb_disable_legacy_mode_local_object_locks is the way back if the local object locks that a
+// node with table locks off takes (#37355) misbehave. With it on, a transaction there takes no
+// object locks, as before #37355: a new mode DDL on another node does not wait for it, and its
+// catalog cache is not refreshed, so the tserver catalog version check is what stops it after a
+// breaking DDL. The flag has no effect on a node with table locks on.
+class PgObjectLocksTestTableLocksOffLocksOff : public PgObjectLocksTestNewTxnVsLegacyDdl {
+ protected:
+  // Promotes the cluster, creates table test, and restarts ts with table locks off and the flag
+  // on.
+  void SetUpTableLocksOffNode(ExternalTabletServer* ts) {
+    ASSERT_NO_FATALS(PromoteAll());
+    {
+      auto conn = ASSERT_RESULT(LibPqTestBase::ConnectToTs(*cluster_->tablet_server(0)));
+      ASSERT_OK(conn.Execute("CREATE ROLE r"));
+      ASSERT_OK(conn.Execute("CREATE TABLE test(k INT PRIMARY KEY, v INT)"));
+      ASSERT_OK(conn.Execute("INSERT INTO test SELECT generate_series(1, 10), 0"));
+      ASSERT_OK(conn.Execute("GRANT SELECT ON test TO r"));
+    }
+    ts->RemoveExtraFlag("ysql_yb_disable_legacy_mode_local_object_locks");
+    ts->AddExtraFlag("ysql_yb_disable_legacy_mode_local_object_locks", "true");
+    ASSERT_NO_FATALS(RestartWithTableLocksOff(ts));
+    ASSERT_EQ(
+        ASSERT_RESULT(ts->GetFlag("ysql_yb_disable_legacy_mode_local_object_locks")), "true");
+  }
+};
 
 TEST_F(PgObjectLocksTestTableLocksOffLocksOff, NewDdlDoesNotWaitForWriter) {
-  ASSERT_NO_FATALS(PromoteAll());
   auto* ts1 = cluster_->tablet_server(0);
   auto* ts2 = cluster_->tablet_server(1);
-  {
-    auto conn = ASSERT_RESULT(LibPqTestBase::ConnectToTs(*ts1));
-    ASSERT_OK(conn.Execute("CREATE TABLE test(k INT PRIMARY KEY, v INT)"));
-    ASSERT_OK(conn.Execute("INSERT INTO test SELECT generate_series(1, 10), 0"));
-  }
-
-  ts2->AddExtraFlag("ysql_yb_disable_legacy_mode_local_object_locks", "true");
-  ASSERT_NO_FATALS(RestartWithTableLocksOff(ts2));
-  ASSERT_EQ(
-      ASSERT_RESULT(ts2->GetFlag("ysql_yb_disable_legacy_mode_local_object_locks")), "true");
+  ASSERT_NO_FATALS(SetUpTableLocksOffNode(ts2));
 
   auto writer_conn = ASSERT_RESULT(LibPqTestBase::ConnectToTs(*ts2));
   ASSERT_OK(writer_conn.Execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ"));
@@ -2158,6 +2119,28 @@ TEST_F(PgObjectLocksTestTableLocksOffLocksOff, NewDdlDoesNotWaitForWriter) {
   ASSERT_OK(writer_conn.Execute("ROLLBACK"));
   ASSERT_TRUE(create_index_done);
   ASSERT_OK(create_index_future.get());
+}
+
+TEST_F(PgObjectLocksTestTableLocksOffLocksOff, ReaderStoppedByCatalogVersionCheck) {
+  auto* ts1 = cluster_->tablet_server(0);
+  auto* ts2 = cluster_->tablet_server(1);
+  ASSERT_NO_FATALS(SetUpTableLocksOffNode(ts2));
+
+  auto reader_conn = ASSERT_RESULT(LibPqTestBase::ConnectToTs(*ts2));
+  ASSERT_OK(reader_conn.Execute("SET ROLE r"));
+  ASSERT_OK(reader_conn.Execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ"));
+  ASSERT_EQ(ASSERT_RESULT(reader_conn.FetchRow<int64_t>("SELECT COUNT(*) FROM test")), 10);
+
+  auto ddl_conn = ASSERT_RESULT(LibPqTestBase::ConnectToTs(*ts1));
+  ASSERT_OK(ddl_conn.Execute("REVOKE SELECT ON test FROM r"));
+  WaitForCatalogVersionToPropagate();
+
+  auto result = reader_conn.FetchRow<int64_t>("SELECT COUNT(*) FROM test");
+  ASSERT_NOK(result);
+  ASSERT_STR_CONTAINS(
+      result.status().ToString(),
+      "The catalog snapshot used for this transaction has been invalidated");
+  ASSERT_OK(reader_conn.Execute("ROLLBACK"));
 }
 
 TEST_F(PgObjectLocksTest, ExclusiveLockReleaseInvalidatesCatalogCache) {

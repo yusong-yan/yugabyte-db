@@ -206,6 +206,12 @@ extern bool yb_cdcsdk_allow_dml_without_pk;
 
 extern bool yb_enable_object_locking_infra;
 
+// Keep in sync with the same definition in common_flags.cc
+#ifdef NDEBUG
+#define kDisableLegacyModeLocalObjectLocks false
+#else
+#define kDisableLegacyModeLocalObjectLocks true
+#endif
 extern bool yb_disable_legacy_mode_local_object_locks;
 
 extern bool yb_enable_ddl_savepoint_infra;
