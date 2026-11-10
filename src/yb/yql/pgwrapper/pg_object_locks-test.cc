@@ -2122,6 +2122,44 @@ TEST_F(PgObjectLocksTestNewTxnVsLegacyDdl, NewModeAddForeignKeyWithLegacyWriter)
   }
 }
 
+// Test for #37327.
+//
+// ysql_yb_disable_legacy_mode_local_object_locks must also turn off the local object locks of a
+// transaction on a node with table locks off, which is not in new mode even after the infra auto
+// flag is promoted. With it on, a writer there takes no object locks, so a new mode CREATE INDEX
+// on another node does not wait for it.
+class PgObjectLocksTestTableLocksOffLocksOff : public PgObjectLocksTestNewTxnVsLegacyDdl {};
+
+TEST_F(PgObjectLocksTestTableLocksOffLocksOff, NewDdlDoesNotWaitForWriter) {
+  ASSERT_NO_FATALS(PromoteAll());
+  auto* ts1 = cluster_->tablet_server(0);
+  auto* ts2 = cluster_->tablet_server(1);
+  {
+    auto conn = ASSERT_RESULT(LibPqTestBase::ConnectToTs(*ts1));
+    ASSERT_OK(conn.Execute("CREATE TABLE test(k INT PRIMARY KEY, v INT)"));
+    ASSERT_OK(conn.Execute("INSERT INTO test SELECT generate_series(1, 10), 0"));
+  }
+
+  ts2->AddExtraFlag("ysql_yb_disable_legacy_mode_local_object_locks", "true");
+  ASSERT_NO_FATALS(RestartWithTableLocksOff(ts2));
+  ASSERT_EQ(
+      ASSERT_RESULT(ts2->GetFlag("ysql_yb_disable_legacy_mode_local_object_locks")), "true");
+
+  auto writer_conn = ASSERT_RESULT(LibPqTestBase::ConnectToTs(*ts2));
+  ASSERT_OK(writer_conn.Execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ"));
+  ASSERT_OK(writer_conn.Execute("UPDATE test SET v = 42 WHERE k = 1"));
+
+  auto create_index_future = std::async(std::launch::async, [&]() -> Status {
+    auto ddl_conn = VERIFY_RESULT(LibPqTestBase::ConnectToTs(*ts1));
+    return ddl_conn.Execute("CREATE INDEX test_v_idx ON test(v)");
+  });
+  const auto create_index_done =
+      create_index_future.wait_for(30s * kTimeMultiplier) == std::future_status::ready;
+  ASSERT_OK(writer_conn.Execute("ROLLBACK"));
+  ASSERT_TRUE(create_index_done);
+  ASSERT_OK(create_index_future.get());
+}
+
 TEST_F(PgObjectLocksTest, ExclusiveLockReleaseInvalidatesCatalogCache) {
   const auto ts1_idx = 1;
   const auto ts2_idx = 2;

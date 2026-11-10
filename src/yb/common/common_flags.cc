@@ -247,15 +247,16 @@ DEFINE_RUNTIME_AUTO_PG_FLAG(bool, yb_enable_object_locking_infra, kLocalPersiste
     "during upgrade. Both this flag and enable_object_locking_for_table_locks "
     "must be true to enable the feature.");
 
-// A new mode DDL waits for DMLs through object locks only, so a transaction that starts while
-// ysql_yb_enable_object_locking_infra is off takes its local DML locks too, or such a DDL does
-// not wait for it during the promotion (#36572). Escape hatch for that.
+// A new mode DDL waits for DMLs through object locks only, so a transaction that is not in new
+// mode takes its local DML locks too, or such a DDL does not wait for it: during the promotion
+// (#36572), and on a node with table locks off (#37355). Escape hatch for those locks.
 DEFINE_RUNTIME_PG_FLAG(bool, yb_disable_legacy_mode_local_object_locks, false,
-    "When true, transactions that start while ysql_yb_enable_object_locking_infra is false "
-    "(legacy mode) take no object locks and refresh their catalog cache only between "
-    "transactions, as before. Otherwise they take local object locks of mode RowExclusive and "
-    "weaker for their DMLs, so that DDLs that run with object locking wait for them. Has no "
-    "effect once ysql_yb_enable_object_locking_infra is true.");
+    "When true, transactions that are not in new mode take no object locks and refresh their "
+    "catalog cache only between transactions, as before. Otherwise they take local object "
+    "locks of mode RowExclusive and weaker for their DMLs, so that DDLs that run with object "
+    "locking wait for them. A transaction is in new mode when it starts while both "
+    "ysql_yb_enable_object_locking_infra and enable_object_locking_for_table_locks are true; "
+    "this flag has no effect on it.");
 TAG_FLAG(ysql_yb_disable_legacy_mode_local_object_locks, advanced);
 
 DEFINE_NON_RUNTIME_bool(ysql_yb_pg_partman_use_native_txn_ddl_and_locks,
